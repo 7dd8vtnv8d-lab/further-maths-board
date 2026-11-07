@@ -371,7 +371,11 @@ function frame(){
   for (const p of peers) {
     if (!p.presence || !p.primary) continue;
     const cur = p.presence.cur; if (!Array.isArray(cur) || !num(cur[0]) || !num(cur[1])) continue;
-    const sx = (cur[0] - cam.x) * cam.z, sy = (cur[1] - cam.y) * cam.z;
+    let dp = curDisp.get(p.peer);
+    if (!dp || Math.hypot(cur[0] - dp.x, cur[1] - dp.y) * cam.z > 600) { dp = { x: cur[0], y: cur[1] }; curDisp.set(p.peer, dp); }
+    dp.x += (cur[0] - dp.x) * 0.3; dp.y += (cur[1] - dp.y) * 0.3;
+    if (Math.hypot(cur[0] - dp.x, cur[1] - dp.y) * cam.z > 0.5) animating = true;
+    const sx = (dp.x - cam.x) * cam.z, sy = (dp.y - cam.y) * cam.z;
     if (sx < -40 || sy < -40 || sx > W + 40 || sy > H + 40) continue;
     const colr = safeCol(p.presence.col), name = safeName(p.presence.name);
     ctx.fillStyle = colr; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
@@ -441,7 +445,12 @@ const members = new Map();         // uid -> {uid, name, col, j, v}
 const pres = new Map();            // peerId -> {uid, p, t}
 let clock = 0;
 let meta = { name:'', v:0, by:'' };
-const S = { room:null, act:{}, bc:null, token:0, net:'starting', lib:null, open:false };
+const S = { room:null, act:{}, bc:null, relay:null, relayUp:0, netStart:0, token:0, lib:null, open:false };
+// Each open tab gets its own id, so messages arriving both directly and through the relay can be matched up.
+const TAB = Array.from(crypto.getRandomValues(new Uint8Array(8)), b => b.toString(16).padStart(2, '0')).join('');
+const TAB_RE = /^[0-9a-f]{16}$/;
+const peer2tab = new Map(), tab2peer = new Map(), known = new Set();
+const curDisp = new Map();
 let presState = {};
 
 function hslHex(h, s, l){ s /= 100; l /= 100; const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l), f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1))); return '#' + [f(0), f(8), f(4)].map(x => Math.round(x * 255).toString(16).padStart(2, '0')).join(''); }
@@ -511,16 +520,31 @@ function sendRecs(list, target){
 }
 function send(kind, data, target){
   const a = S.act[kind];
-  if (a) { try { const p = a.send(data, target ? { target } : undefined); if (p && p.catch) p.catch(() => {}); } catch(e) {} }
+  if (a) {
+    const pid = target ? tab2peer.get(target) : null;
+    if (!target || pid) { try { const p = a.send({ t: TAB, d: data }, pid ? { target: pid } : undefined); if (p && p.catch) p.catch(() => {}); } catch(e) {} }
+  }
+  if (S.relay) {
+    if (kind === 'pres' && !target) relayPres();
+    else { try { S.relay.send(kind, data, target || null).catch(() => {}); } catch(e) {} }
+  }
   if (!target && S.bc && (kind === 'recs' || kind === 'mem' || kind === 'meta')) { try { S.bc.postMessage({ k: kind, d: data }); } catch(e) {} }
 }
-function emit(topic, data){ if (S.room) send(topic, data); }
+// The relay carries cursors a little less often, to stay well inside the public brokers' limits.
+let relayPresT = 0, relayPresTimer = 0;
+function relayPres(){
+  const wait = 150 - (performance.now() - relayPresT);
+  if (wait <= 0) { relayPresT = performance.now(); if (S.relay) S.relay.send('pres', presPayload(), null).catch(() => {}); }
+  else if (!relayPresTimer) relayPresTimer = setTimeout(() => { relayPresTimer = 0; relayPres(); }, wait);
+}
+function emit(topic, data){ if (S.room || S.relay) send(topic, data); }
+function presPayload(){ return Object.assign({ uid: me.id, name: me.name }, presState); }
 
 let presTimer = 0;
 function presenceSet(patch){
   for (const [k, v] of Object.entries(patch)) { if (v === null) delete presState[k]; else presState[k] = v; }
   if (presTimer) return;
-  presTimer = setTimeout(() => { presTimer = 0; if (S.room) send('pres', Object.assign({ uid: me.id, name: me.name }, presState)); }, 66);
+  presTimer = setTimeout(() => { presTimer = 0; if (S.room || S.relay) send('pres', presPayload()); }, 70);
 }
 let viewTimer = 0;
 function sendView(){
@@ -589,12 +613,40 @@ function onSum(list, peerId){
   for (const r of recs.values()) { const t = theirs.get(r.id); if (!t || t[1] < r.v || (t[1] === r.v && t[2] < r.by)) out.push(r); }
   if (out.length) sendRecs(out, peerId);
 }
-function greet(peerId){
-  send('mem', [...members.values()], peerId);
-  if (meta.v) send('meta', meta, peerId);
-  send('sum', digest(), peerId);
-  send('pres', Object.assign({ uid: me.id, name: me.name }, presState), peerId);
+function greet(tab){
+  send('mem', [...members.values()], tab);
+  if (meta.v) send('meta', meta, tab);
+  send('sum', digest(), tab);
+  send('pres', presPayload(), tab);
 }
+function recv(kind, d, tab){
+  if (typeof tab !== 'string' || !TAB_RE.test(tab) || tab === TAB) return;
+  if (kind === 'bye') { dropTab(tab); return; }
+  if (!known.has(tab)) { known.add(tab); greet(tab); }
+  switch (kind) {
+    case 'recs': onRecs(d); break;
+    case 'mem': onMem(d); break;
+    case 'meta': onMeta(d); break;
+    case 'sum': onSum(d, tab); break;
+    case 'pres': onPres(d, tab); break;
+    case 'mv': onMv(d); break;
+    case 'ink': onInk(d, tab); break;
+  }
+}
+function dropTab(tab){
+  pres.delete(tab); trails.delete(tab); curDisp.delete(tab); known.delete(tab);
+  for (const k of drafts.keys()) if (k.startsWith(tab + ':')) drafts.delete(k);
+  if (followPeer === tab) stopFollow(true);
+  rebuildPeers();
+}
+// Heartbeat: keep everyone's people list fresh, and drop anyone silent for 15 s.
+setInterval(() => {
+  if (!S.open) return;
+  if (S.room || S.relayUp) send('pres', presPayload());
+  const now = performance.now();
+  for (const [tab, e] of [...pres]) if (now - e.t > 15000) dropTab(tab);
+  updateStatus();
+}, 4000);
 function rebuildPeers(){
   const primary = new Map();
   for (const [peer, e] of pres) { if (e.uid === me.id) continue; const q = primary.get(e.uid); if (!q || e.t > q.t) primary.set(e.uid, { peer, t: e.t }); }
@@ -619,7 +671,7 @@ async function idbPut(k, v){ try { const d = await idb(); d.transaction('boards'
 let saveT = 0;
 function saveSoon(){ clearTimeout(saveT); saveT = setTimeout(saveNow, 700); }
 function saveNow(){ clearTimeout(saveT); if (!board || !S.open) return; idbPut(board, { recs:[...recs.values()], mem:[...members.values()], meta, clock }); }
-window.addEventListener('pagehide', () => { saveNow(); saveViewNow(); });
+window.addEventListener('pagehide', () => { if (S.room || S.relay) send('bye', 1); saveNow(); saveViewNow(); });
 document.addEventListener('visibilitychange', () => { if (document.hidden) { saveNow(); saveViewNow(); } });
 
 function boardsList(){ try { const a = JSON.parse(store.get('fmwb:boards') || '[]'); return Array.isArray(a) ? a.filter(b => b && /^[a-z0-9]{8,24}$/.test(b.code)) : []; } catch(e) { return []; } }
@@ -654,8 +706,11 @@ function restoreView(){
 function leaveBoard(){
   if (S.open) { saveNow(); saveViewNow(); }
   S.token++;
+  if (S.room || S.relay) send('bye', 1);
   if (S.room) { try { S.room.leave(); } catch(e) {} }
-  S.room = null; S.act = {};
+  if (S.relay) { const r = S.relay; setTimeout(() => r.close(), 300); }
+  S.room = null; S.act = {}; S.relay = null; S.relayUp = 0;
+  peer2tab.clear(); tab2peer.clear(); known.clear(); curDisp.clear();
   if (S.bc) { try { S.bc.close(); } catch(e) {} S.bc = null; }
   S.open = false;
 }
@@ -666,7 +721,7 @@ async function openBoard(code){
   leaveBoard();
   const token = S.token;
   board = code;
-  objs.clear(); recs.clear(); members.clear(); pres.clear(); drafts.clear(); trails.clear();
+  objs.clear(); recs.clear(); members.clear(); pres.clear(); drafts.clear(); trails.clear(); known.clear(); curDisp.clear();
   orderDirty = true; peers = []; selection.clear(); undoStack = []; redoStack = []; followPeer = null; clock = 0; presState = {};
   meta = { name:'', v:0, by:'' };
   updateHist(); renderProps(); renderPeople(); showBoardName(); dirty();
@@ -692,44 +747,48 @@ async function openBoard(code){
   joinNet(token);
 }
 async function joinNet(token){
-  S.net = 'connecting'; updateStatus();
-  try { if (!S.lib) S.lib = await import(LIB_URL); }
-  catch(e) { if (token === S.token) { S.net = 'offline'; updateStatus(); } return; }
-  if (token !== S.token) return;
-  let room;
-  try { room = S.lib.joinRoom({ appId: APP_ID, password: 'fmwb-' + board }, 'board-' + board, { onJoinError: () => {} }); }
-  catch(e) { S.net = 'offline'; updateStatus(); return; }
+  S.netStart = performance.now(); updateStatus();
+  setTimeout(() => { if (token === S.token) updateStatus(); }, 12500);
+  // 1. Encrypted relay through public brokers: works on every network, including mobile data.
+  if (window.FMRelay && window.crypto && crypto.subtle) {
+    FMRelay.create(board, TAB,
+      (k, d, from, to) => { if (token === S.token && (!to || to === TAB)) recv(k, d, from); },
+      up => { if (token !== S.token) return; const was = S.relayUp; S.relayUp = up; if (up && !was) { send('pres', presPayload()); if (me.name) send('mem', [...members.values()]); } updateStatus(); })
+      .then(r => { if (token !== S.token) r.close(); else S.relay = r; })
+      .catch(() => {});
+  }
+  // 2. Direct browser-to-browser connections: fastest when the network allows them.
+  try { if (!S.lib) S.lib = await import(LIB_URL); } catch(e) { S.lib = null; }
+  if (token !== S.token || !S.lib) { updateStatus(); return; }
+  let room = null;
+  try { room = S.lib.joinRoom({ appId: APP_ID, password: 'fmwb-' + board }, 'board-' + board, { onJoinError: () => {} }); } catch(e) { room = null; }
+  if (!room) { updateStatus(); return; }
   S.room = room;
-  const mk = (n, fn) => { const a = room.makeAction(n); a.onMessage = (d, info) => { if (token === S.token) fn(d, info && info.peerId); }; S.act[n] = a; };
-  mk('recs', d => onRecs(d));
-  mk('mem', d => onMem(d));
-  mk('meta', d => onMeta(d));
-  mk('sum', (d, peer) => onSum(d, peer));
-  mk('pres', (d, peer) => onPres(d, peer));
-  mk('mv', d => onMv(d));
-  mk('ink', (d, peer) => onInk(d, peer));
-  room.onPeerJoin = peer => { if (token === S.token) { greet(peer); updateStatus(); } };
-  room.onPeerLeave = peer => {
-    if (token !== S.token) return;
-    pres.delete(peer); trails.delete(peer);
-    for (const k of drafts.keys()) if (k.startsWith(peer + ':')) drafts.delete(k);
-    if (followPeer === peer) stopFollow(true);
-    rebuildPeers();
-  };
-  S.net = 'live'; updateStatus();
+  for (const n of ['recs', 'mem', 'meta', 'sum', 'pres', 'mv', 'ink', 'bye']) {
+    const a = room.makeAction(n);
+    a.onMessage = (m, info) => {
+      if (token !== S.token || !m || typeof m.t !== 'string' || !TAB_RE.test(m.t)) return;
+      const pid = info && info.peerId; if (pid) { peer2tab.set(pid, m.t); tab2peer.set(m.t, pid); }
+      recv(n, m.d, m.t);
+    };
+    S.act[n] = a;
+  }
+  room.onPeerJoin = pid => { if (token !== S.token) return; try { const pr = S.act.pres.send({ t: TAB, d: presPayload() }, { target: pid }); if (pr && pr.catch) pr.catch(() => {}); } catch(e) {} };
+  room.onPeerLeave = pid => { if (token !== S.token) return; const tab = peer2tab.get(pid); peer2tab.delete(pid); if (tab && tab2peer.get(tab) === pid) tab2peer.delete(tab); };
+  updateStatus();
+  send('pres', presPayload());
   if (me.name) send('mem', [...members.values()]);
 }
 
 function updateStatus(){
   const el = $('#status'), t = el.querySelector('.txt');
   const others = new Set(peers.map(p => p.uid)).size;
+  const linked = !!S.room || S.relayUp > 0;
   el.classList.remove('live', 'warn');
   let txt, tip;
-  if (S.net === 'live') {
-    el.classList.add('live');
-    txt = others ? `Live · ${others + 1} here` : 'Live · waiting for friends';
-    tip = 'Changes go straight to everyone on this board and are saved on this device.';
-  } else if (S.net === 'connecting' || S.net === 'starting') { txt = 'Connecting…'; tip = 'Looking for others on this board.'; }
+  if (others) { el.classList.add('live'); txt = `Live · ${others + 1} here`; tip = 'Everyone here sees changes as they happen. The board is also saved on this device.'; }
+  else if (linked) { el.classList.add('live'); txt = 'Live · waiting for friends'; tip = 'Connected. Send the Invite link and people will appear here.'; }
+  else if (performance.now() - S.netStart < 12000) { txt = 'Connecting…'; tip = 'Looking for others on this board.'; }
   else { el.classList.add('warn'); txt = 'Offline · saved here'; tip = 'You can keep working. It saves on this device and syncs when you are back online.'; }
   t.textContent = txt; el.title = tip;
 }
@@ -819,6 +878,11 @@ const newZ = () => Date.now() + Math.random();
 const pointers = new Map();
 let inkTimer = 0, inkSent = 0;
 function evPos(e){ return { sx: e.clientX - rect.left, sy: e.clientY - rect.top }; }
+function remeasure(){ rect = cv.getBoundingClientRect(); }
+// Phones can leave the page nudged after the on-screen keyboard closes; snap it back and re-measure.
+function unNudge(){ if (window.scrollX || window.scrollY) window.scrollTo(0, 0); remeasure(); }
+window.addEventListener('scroll', unNudge, { passive:true });
+if (window.visualViewport) { visualViewport.addEventListener('resize', unNudge); visualViewport.addEventListener('scroll', unNudge); }
 function setCursorClass(){
   cv.className = 't-' + tool + (spaceDown ? ' panning' : '') + (gesture && gesture.mode === 'pan' ? ' grabbing' : '');
 }
@@ -830,6 +894,7 @@ cv.addEventListener('pointerdown', e => {
   if (gesture && gesture !== before && gesture.mode !== 'pinch') { gesture.pid = e.pointerId; gesture.touch = e.pointerType === 'touch'; }
 });
 function onDown(e){
+  remeasure();
   if (editing) commitText();
   closeMenus();
   if (e.pointerType === 'pen') {
@@ -1533,6 +1598,7 @@ $('#joinForm').addEventListener('submit', e => {
   if (taken) { $('#joinErr').textContent = 'Someone on this board is already called ' + taken.name + '. Try another name.'; $('#joinErr').hidden = false; $('#nameIn').focus(); return; }
   me.name = n; store.set('fmwb:name', n);
   $('#joinScrim').hidden = true; $('#homeName').textContent = n;
+  $('#nameIn').blur(); setTimeout(unNudge, 50); setTimeout(unNudge, 400);
   if (S.open) upsertMe();
   presenceSet({ name:n }); renderPeople();
 });

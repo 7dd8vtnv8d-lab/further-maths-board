@@ -21,7 +21,8 @@ A shared, endless whiteboard for working through maths together.
 ## How it works
 
 - The site is plain static files hosted on GitHub Pages. There is no server and no database.
-- Browsers connect directly to each other (WebRTC). Public Nostr relays are used only to introduce browsers to each other, and that introduction is encrypted with a key that comes from the board link.
+- Browsers connect directly to each other (WebRTC) when the network allows it. Public Nostr relays are used only to introduce browsers to each other, and that introduction is encrypted with a key that comes from the board link.
+- Every message is also sent through free public MQTT brokers (`relay.js`), so boards still sync on mobile data and strict Wi-Fi, where direct connections often fail. Those messages are end-to-end encrypted (AES-256-GCM, with a key derived from the board link), and the topic name is a hash, so the brokers can neither read the boards nor find them.
 - Each board is saved in the browser of everyone who uses it (IndexedDB) and syncs when two or more people have it open.
 - Anyone with a board's link can join and edit that board, so only share links with people you trust.
 

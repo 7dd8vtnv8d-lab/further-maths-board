@@ -121,7 +121,7 @@ button,input,select,textarea{font:inherit;color:inherit}
 button{cursor:pointer;touch-action:manipulation}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
-#app{position:relative;height:100%;overflow:hidden;user-select:none;-webkit-user-select:none}
+#app{position:fixed;inset:0;overflow:hidden;user-select:none;-webkit-user-select:none}
 #board{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:crosshair}
 #board.t-select{cursor:default}
 #board.t-hand,#board.panning{cursor:grab}
